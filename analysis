@@ -1,0 +1,227 @@
+# load package
+library(sjPlot)
+library(dplyr)
+library(broom)
+library(emmeans)
+library(car)
+library(ggplot2)
+
+# Read data
+data <- read.csv("final_data.csv")
+
+# Create the age_group: pre, early, late adolescence
+data <- data %>%
+  mutate(age_group = case_when(
+    age >= 9 & age <= 10.99 ~ "pre",
+    age >= 11 & age <= 14.99 ~ "early",
+    age >= 15 & age <= 19.99 ~ "late",
+    TRUE ~ NA_character_  # Handles ages outside the range
+  ),
+    # Create the category if they meet the sleep guideline
+    meets_guideline = case_when(
+      age >= 6 & age <= 12 & sleep_hr == 1 ~ 1,               # 9–11 hours for 6–12 years
+      age >= 13 & age <= 18 & sleep_hr %in% c(1, 2) ~ 1,      # 8–10 hours for 13–18 years
+      TRUE ~ 0
+ )
+)
+
+# Extract into different developmental strage
+pre <- subset(data, data$age >= 9 & data$age <=10.99)
+early <- subset(data, data$age >= 11 & data$age <=14.99)
+late <- subset(data, data$age >= 15 & data$age <=19.99)
+
+# Summary mean and standard deviation
+summary_stats <- sapply(late, function(x) {
+  if (is.numeric(x)) {
+    m <- mean(x, na.rm = TRUE)
+    s <- sd(x, na.rm = TRUE)
+    sprintf("%.2f ± %.2f", m, s)
+  } else {
+    NA
+  }
+}
+)
+
+# Convert the result into data frame for easier viewing
+summary_df <- data.frame(Variable = names(summary_stats), Mean_SD = summary_stats)
+
+# Run the correlation analysis
+tab_corr(late, p.numeric = TRUE, triangle = "lower", 
+         na.deletion = c("pairwise"))
+
+# Multiple Linear regression 
+model <- lm(CBCL_Total ~  SDS_DIMS_T, data = late)
+
+summary(model)
+
+# Create the table for the beta-estimate 
+summary_table <- summary(model)$coefficients
+
+# Convert to data frame
+summary_df <- as.data.frame(summary_table)
+
+# Rename columns for clarity
+colnames(summary_df) <- c("Estimate", "Std.Error", "t.value", "p.value")
+
+##------- Create the between-group analysis 
+data$age_group <- as.factor(data$age_group)
+
+# 3. Define WJ outcome variables
+SCARED <- c("SCARED_P_GD", "SCARED_P_PN", "SCARED_P_SC", 
+            "SCARED_P_SH","SCARED_P_SP")
+
+SDS <- c("SDS_DA_T", "SDS_DIMS_T", "SDS_DOES_T",
+         "SDS_SBD_T", "SDS_SHY_T", "SDS_SWDT_T")
+
+CBCL <- c("CBCL_Int", "CBCL_Ext")
+
+# 4. Function to run MANCOVA for a given covariate
+run_manova <- function(dvs, group_var, data) {
+  # Ensure group variable is a factor
+  data[[group_var]] <- as.factor(data[[group_var]])
+  
+  # Create formula for MANOVA
+  formula_text <- paste("cbind(", paste(dvs, collapse = ", "), ") ~", group_var)
+  formula <- as.formula(formula_text)
+  
+  # Run MANOVA
+  manova_model <- manova(formula, data = data)
+  
+  # Wilks' Lambda test
+  summary_results <- summary(manova_model, test = "Wilks")
+  print(summary_results)
+  
+  return(manova_model)
+}
+
+# Run manova
+scared_mod <- run_manova(SCARED, group_var = "age_group", data = data)
+cbcl_mod <- run_manova(SDS, group_var = "age_group", data = data)
+sds_mod <- run_manova(CBCL, group_var = "age_group", data = data)
+
+# Function post hoc
+run_posthoc <- function(dv, data) {
+  # Remove rows with NA in group or DV
+  clean_data <- data %>%
+    filter(!is.na(age_group), !is.na(.data[[dv]])) %>%
+    mutate(group = as.character(as.integer(age_group)))  # Ensure group is character
+  
+  # Fit ANOVA model
+  formula <- as.formula(paste(dv, "~ age_group"))
+  model <- lm(formula, data = clean_data)
+  
+  # Estimated marginal means
+  emms <- emmeans(model, ~ age_group)
+  emms_df <- as.data.frame(summary(emms))
+  emms_df$DV <- dv
+  
+  # Tukey post hoc comparisons
+  posthoc <- pairs(emms, adjust = "tukey")
+  posthoc_df <- as.data.frame(summary(posthoc))
+  posthoc_df$DV <- dv
+  
+  # Separate contrast into group1 and group2
+  posthoc_df <- posthoc_df %>%
+    separate(contrast, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>%
+    mutate(group1 = trimws(as.character(group1)),
+           group2 = trimws(as.character(group2)))
+  
+  # Group-wise mean and SD
+  group_stats <- clean_data %>%
+    group_by(age_group) %>%
+    summarise(
+      Mean = mean(.data[[dv]], na.rm = TRUE),
+      SD = sd(.data[[dv]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  posthoc_df <- posthoc_df %>%
+    separate(contrast, into = c("group1", "group2"), sep = " - ", remove = FALSE) %>%
+    mutate(
+      group1 = trimws(as.character(gsub("group", "", group1))),
+      group2 = trimws(as.character(gsub("group", "", group2)))
+    )
+  
+  # Join group stats
+  posthoc_df <- posthoc_df %>%
+    left_join(group_stats %>% rename(group1 = age_group, Mean1 = Mean, SD1 = SD), 
+              by = "group1") %>%
+    left_join(group_stats %>% rename(group2 = age_group, Mean2 = Mean, SD2 = SD), 
+              by = "group2")
+  
+  # Return results
+  list(
+    EMMs_df = emms_df,
+    PostHoc_df = posthoc_df
+  )
+}
+
+# Run post hoc test
+posthoc_scared <- lapply(SCARED, function(dv) run_posthoc(dv, data))
+posthoc_cbcl <- lapply(CBCL, function(dv) run_posthoc(dv, data))
+posthoc_sds <- lapply(SDS, function(dv) run_posthoc(dv, data))
+
+# Combine all post hoc results
+combined_posthoc <- bind_rows(
+  lapply(posthoc_scared, function(x) x$PostHoc_df),
+  lapply(posthoc_cbcl, function(x) x$PostHoc_df),
+  lapply(posthoc_sds, function(x) x$PostHoc_df)
+)
+
+## ----------------- Figures ----------------
+data$age_group <- as.factor(data$age_group)
+
+data <- subset(data, !is.na(data$age_group))
+
+# Define custom order for 'MesureType'
+desired_order <- c("pre", "early", "late")  # Modify these based on your actual categories
+
+# Reorder 'MesureType' to match the desired order
+data$MesureType <- factor(data$age_group, levels = desired_order)
+
+# Create the violin plot embedded with box plot
+ggplot(data, aes(x = MesureType, y = SDS_SWDT_T, fill = MesureType)) +
+  geom_violin(trim = FALSE, alpha = 0.5) +
+  geom_boxplot(width = 0.1, alpha = 0.8, color = "black", size = 1.2, outlier.shape = 1) +
+  geom_jitter(aes(color = MesureType), width = 0.1, size = 2, alpha = 0.7) +
+  scale_color_manual(values = scales::alpha(c("#033a5c", "#1a5050", "#4c00b0"), 0.5)) +
+  scale_fill_manual(values = c("pre" = "#C6DBEF", "early" = "#cce7c9", "late" = "#E1BEE7")) +
+  labs(title = "SCARED_GD Scores Across Age Groups",
+       x = "Adolescent Group",
+       y = "Sleep Wake-Transition Disorder") +
+  theme_classic()
+
+## Regression Graph 
+model <- lm(SCARED_P_SP ~ hhi + SDS_DA_T + SDS_DIMS_T +
+              SDS_SBD_T + SDS_SWDT_T, data = early)
+
+# Create new data for prediction of specific variable while controlling other variable
+new_data <- data.frame(
+  hhi    = mean(early$hhi, na.rm = TRUE),
+  SDS_DIMS_T    = mean(early$SDS_DIMS_T, na.rm = TRUE),
+  SDS_DA_T    = mean(early$SDS_DA_T, na.rm = TRUE),
+  SDS_SWDT_T    = mean(early$SDS_SWDT_T, na.rm = TRUE),
+  SDS_SBD_T  = seq(min(early$SDS_SBD_T, na.rm = TRUE),
+                    max(early$SDS_SBD_T, na.rm = TRUE),
+                    length.out = 100)
+)
+
+# Predict with confidence intervals
+pred <- predict(model, newdata = new_data, interval = "confidence")
+pred_df <- cbind(new_data, pred)
+
+# Plot it into line graph (95% confidence interval) 
+ggplot() +
+  # Original data points
+  geom_point(data = early, aes(x = SDS_SBD_T, y = SCARED_P_SP), color = "gray", 
+             alpha = 0.6) +
+  # Prediction line
+  geom_line(data = pred_df, aes(x = SDS_SBD_T, y = fit), color = "#1a5050", 
+            size = 1) +
+  # Confidence interval ribbon
+  geom_ribbon(data = pred_df, aes(x = SDS_SBD_T, ymin = lwr, ymax = upr), 
+              alpha = 0.2, fill = "#8A9A58") +
+  labs(title = "Effect of SDS_SWDT_T on SCARED_P_GD (95% CI)",
+       x = "SDS_SWDT_T",
+       y = "Pred") + 
+  theme_classic()

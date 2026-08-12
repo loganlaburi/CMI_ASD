@@ -1,4 +1,5 @@
-# load package
+
+# Load package
 library(sjPlot)
 library(dplyr)
 library(broom)
@@ -6,17 +7,11 @@ library(emmeans)
 library(car)
 library(ggplot2)
 
-# read the data
-df <- read.csv("raw_data.csv")
+# Read data
+data <- read.csv("raw_data.csv")
+df <- subset(data, as.numeric(data$Physical.Age) >=9 & 
+                 as.numeric(data$Physical.Age) <= 19.99)
 
-# Other labels
-ASD_LABEL  <- "Autism Spectrum Disorder"
-asd_aliases <- c(ASD_LABEL, "ASD", "Autistic Disorder")  
-
-# Detect diagnosis columns (works for ...DX_01 ...DX_10 and ..._Code)
-dx_pattern <- "^Diagnosis_ClinicianConsensus\\.DX_(0[1-9]|10)$"
-
-# Find the column that has ICD-10 diagnosis
 dx_cols <- grep("^Diagnosis_ClinicianConsensus\\.DX_(0[1-9]|10)$",
                 names(df), value = TRUE)
 
@@ -29,17 +24,22 @@ norm_col <- function(x) {
 
 dx_df <- as.data.frame(lapply(df[dx_cols], norm_col), stringsAsFactors = FALSE)
 
-# Find unique diagnoses across all cells (excluding ASD)
+# Unique diagnoses across all cells (excluding ASD)
 all_dx <- unlist(dx_df, use.names = FALSE)
 unique_dx_excl_asd <- sort(unique(all_dx[!is.na(all_dx) & all_dx != "Autism Spectrum Disorder"]))
 
-## Select and clean the dx columns
+ASD_LABEL  <- "Autism Spectrum Disorder"
+asd_aliases <- c(ASD_LABEL, "ASD", "Autistic Disorder")  
+
+# Detect diagnosis columns 
+dx_pattern <- "^Diagnosis_ClinicianConsensus\\.DX_(0[1-9]|10)$"
+
 dx_cols <- grep(dx_pattern, names(df), value = TRUE)
 stopifnot(length(dx_cols) > 0)
 
 dx_df <- as.data.frame(lapply(df[dx_cols], norm_col), stringsAsFactors = FALSE)
 
-## Categorize multiples into corresponding category
+# Map each original label 
 recode_map <- c(
   # ADHD 
   "ADHD-Combined Type"                                    = "ADHD",
@@ -66,7 +66,7 @@ recode_map <- c(
   # Intellectual ability
   "Intellectual Disability-Mild"                          = "Intellectual Disability",
   "Intellectual Disability-Moderate"                      = "Intellectual Disability",
-  "Borderline Intellectual Functioning"                   = "Borderline Intellectual Functioning", 
+  "Borderline Intellectual Functioning"                   = "Borderline Intellectual Functioning", # keep separate (change if desired)
   
   # Learning disorders
   "Specific Learning Disorder with Impairment in Mathematics"        = "Specific Learning Disorder",
@@ -79,7 +79,7 @@ recode_map <- c(
   "Other Specified Tic Disorder"                           = "Tic Disorder",
   "Tourettes Disorder"                                     = "Tic Disorder",
   
-  # OC & related
+  # OCD & related
   "Obsessive-Compulsive Disorder"                          = "Obsessive-Compulsive Disorder",
   "Trichotillomania (Hair-Pulling Disorder)"               = "OC-Related Disorder",
   "Excoriation (Skin-Picking) Disorder"                    = "OC-Related Disorder",
@@ -120,7 +120,7 @@ recode_map <- c(
   "Cannabis Use Disorder"                                  = "Substance Use Disorder"
 )
 
-# Case-insensitive exact recoder
+# Recode
 recode_vec <- function(x, map) {
   x0 <- as.character(x)
   xlow <- tolower(x0)
@@ -133,12 +133,12 @@ recode_vec <- function(x, map) {
 dx_rec <- as.data.frame(lapply(dx_df, recode_vec, map = recode_map),
                         stringsAsFactors = FALSE)
 
-# ASD cohort
+# Check the ASD cohort
 has_asd <- apply(dx_rec, 1, function(r) any(tolower(r) %in% tolower(asd_aliases), na.rm = TRUE))
 asd_n <- sum(has_asd)
 cat("ASD cohort size:", asd_n, "of", nrow(dx_rec), "\n")
 
-# Find comorbodities excluding ASD
+# Unique comorbidities excluding autism
 all_labels_asd <- unlist(dx_rec[has_asd, , drop = FALSE], use.names = FALSE)
 unique_comorbidities <- sort(unique(all_labels_asd[
   !is.na(all_labels_asd) & !(tolower(all_labels_asd) %in% tolower(asd_aliases))
@@ -146,18 +146,14 @@ unique_comorbidities <- sort(unique(all_labels_asd[
 cat("\nUnique comorbidities (collapsed labels, excluding ASD):\n")
 print(unique_comorbidities)
 
-# showing different combination of comorbodities in addition to ASD
+# Autism and other comorbidities
 ## Make sure ASD appears first in the combination string
 make_combo_incl_asd <- function(row) {
   vals <- unique(na.omit(row))
-  # Identify ASD values (case-insensitive)
   is_asd <- tolower(vals) %in% tolower(asd_aliases)
-  # Normalize any ASD alias to the canonical ASD_LABEL
   vals[is_asd] <- ASD_LABEL
-  # De-duplicate in case multiple ASD aliases collapse to same label
   vals <- unique(vals)
   
-  # Check if ASD is present
   if (any(vals == ASD_LABEL)) {
     others <- sort(vals[vals != ASD_LABEL])
     paste(c(ASD_LABEL, others), collapse = " + ")
@@ -175,13 +171,10 @@ combo_tbl <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# Save the combination file into csv
+
 write.csv(combo_tbl, "comorbid.csv")
 
-
-
-## Recode table and map
-# Case-insensitive exact recoder for a vector
+# Recode table and map
 recode_vec <- function(x, map) {
   x0 <- as.character(x)
   xlow <- tolower(x0)
@@ -190,7 +183,7 @@ recode_vec <- function(x, map) {
   ifelse(is.na(m), x0, unname(map[m]))  
 }
 
-# Apply across columns of cleaned dx_df
+# Apply across columns of the df
 dx_rec <- as.data.frame(lapply(dx_df, recode_vec, map = recode_map), stringsAsFactors = FALSE)
 
 orig_long <- unlist(dx_df,  use.names = FALSE)
@@ -202,11 +195,13 @@ cat_long  <- cat_long[keep]
 
 diagnosis_map_tbl <- as.data.frame(table(original = orig_long, category = cat_long),
                                    stringsAsFactors = FALSE)
-
+# Remove zeros 
 diagnosis_map_tbl <- diagnosis_map_tbl[diagnosis_map_tbl$Freq > 0, ]
 diagnosis_map_tbl <- diagnosis_map_tbl[order(diagnosis_map_tbl$category,
                                              -diagnosis_map_tbl$Freq,
                                              diagnosis_map_tbl$original), ]
+diagnosis_map_tbl
+
 
 ## Comorbidities
 asd_aliases <- c("Autism Spectrum Disorder", "ASD", "Autistic Disorder", "F84.0")
@@ -215,6 +210,6 @@ df$comorbidity_count <- apply(dx_rec, 1, function(row) {
   sum(!is.na(row) & !(tolower(row) %in% tolower(asd_aliases)))
 })
 
-data$comorbidity_count <- df$comorbidity_count
+df_asd_only <- df[has_asd, ]
 
-
+write.csv(df_asd_only, "asd_only.csv")

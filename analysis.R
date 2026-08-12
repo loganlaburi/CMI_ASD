@@ -1,5 +1,4 @@
-
-# load package
+# Load package
 library(sjPlot)
 library(dplyr)
 library(broom)
@@ -14,18 +13,16 @@ library(emmeans)
 library(stringr)
 library(lmtest)
 library(sandwich)
+library(marginaleffects)
 
 # Read data
 data <- readRDS("data_after_mice.rds")
-
-# Set seed
 set.seed(123)
 
 # Check if there is missing value 
 sapply(data, function(d) sum(is.na(as.data.frame(d))))
 
-
-## Descripitive statistics
+# Calculate the descripitive statistics
 mutate_vars <- function(df) {
   df <- as.data.frame(df)
   
@@ -33,19 +30,19 @@ mutate_vars <- function(df) {
   df <- df %>%
     mutate(
       age_group = case_when(
-        age >=  9 & age <= 10.99 ~ "pre", # pre adolescent
-        age >= 11 & age <= 14.99 ~ "early", # early adolescent
-        age >= 15 & age <= 19.99 ~ "late", # middle-to-late adolescents,
+        age >=  9 & age < 11 ~ "pre", # pre adolescent
+        age >= 11 & age < 15 ~ "early", # early adolescent
+        age >= 15 & age < 20 ~ "late", # middle-to-late adolescents,
         TRUE ~ NA_character_
       )
     )
   
   # BMI category using BMI percentile 
   df$bmi_category <- with(df, ifelse(
-    is.na(BMI_perc), NA,
-    ifelse(BMI_perc < 5, "Underweight",
-           ifelse(BMI_perc < 85, "Normal Weight",
-                  ifelse(BMI_perc < 95, "Overweight", "Obesity")
+    is.na(bmi_percentile), NA,
+    ifelse(bmi_percentile < 5, "Underweight",
+           ifelse(bmi_percentile < 85, "Normal Weight",
+                  ifelse(bmi_percentile < 95, "Overweight", "Obesity")
            )
     )
   ))
@@ -60,14 +57,16 @@ mutate_vars <- function(df) {
   df
 }
 
+# Summarize
 df_imp <- lapply(data, mutate_vars)
 
-var_int <- c("SDS_DA_T", "SDS_DIMS_T", "SDS_DOES_T",
-             "SDS_SBD_T", "SDS_SHY_T", "SDS_SWDT_T", "SDS_Total_T",
+
+var_int <- c("SDS_DA", "SDS_DIMS", "SDS_DOES",
+             "SDS_SBD", "SDS_SHY", "SDS_SWDT", "SDS_Total",
              "SCARED_P_GD","SCARED_P_PN", "SCARED_P_SC",
              "SCARED_P_SH", "SCARED_P_SP", "SCARED_P_Total",
-             "CBCL_Int_T", "CBCL_Ext_T", "CBCL_Total_T",
-             "BMI_perc", "age", "BMI")  
+             "CBCL_Int", "CBCL_Ext", "CBCL_Total",
+             "bmi_percentile", "age", "BMI")  
 
 summaries_by_imp <- lapply(seq_along(df_imp), function(i) {
   d <- df_imp[[i]]
@@ -105,10 +104,11 @@ summary_pooled <- summary_all %>%
   mutate(Mean_SD = sprintf("%.2f ± %.2f", mean, sd)) %>%
   select(age_group, Variable, Mean_SD, mean, sd)
 
-# Calculating the descripitive stat in the categorical/factorize data
-cat_var <- "sleep_hr" 
 
-# For each imputation, change everything to numeric and get mean +/- sd
+# Choose the categorical variable
+cat_var <- "puberty_stage"  
+
+# Compute mean / sd for each categorical variable
 summaries_by_imp <- lapply(seq_along(df_imp), function(i) {
   d <- as.data.frame(df_imp[[i]])
   if (!cat_var %in% names(d)) return(NULL)
@@ -129,21 +129,24 @@ summaries_by_imp <- lapply(seq_along(df_imp), function(i) {
     mutate(.imp = i, Variable = cat_var)
 })
 
-# Combine and average across imputations
+# Combine and average across imputations 
 summary_pooled <- bind_rows(summaries_by_imp) %>%
   group_by(age_group, Variable) %>%
   summarise(
     mean = mean(mean, na.rm = TRUE),
-    sd   = mean(sd,   na.rm = TRUE),   # descriptive average of SDs
+    sd   = mean(sd,   na.rm = TRUE),   
     .groups = "drop"
   ) %>%
   mutate(Mean_SD = sprintf("%.2f ± %.2f", mean, sd)) %>%
   select(age_group, Variable, Mean_SD, mean, sd)
 
+summary_pooled
+
 
 cat_vars <- c("sex","race","ethnicity","bmi_category","puberty_stage",
-              "hhi","meets_guideline","comorbidity_count")
+              "hhi","comorbidity_count", "sleep_hr")
 
+# Ensure factor levels are consistent across imputations 
 levels_union <- lapply(cat_vars, function(v) {
   lev <- unique(unlist(lapply(df_imp, function(d) {
     if (v %in% names(d)) {
@@ -166,7 +169,7 @@ df_imp <- lapply(df_imp, function(d) {
   d
 })
 
-# average age group across denominator
+# Average age_group size across imputations 
 group_sizes_all <- bind_rows(lapply(seq_along(df_imp), function(i) {
   as.data.frame(df_imp[[i]]) %>%
     filter(!is.na(age_group)) %>%
@@ -206,15 +209,13 @@ counts_avg <- counts_long %>%
   group_by(age_group, Variable, Category) %>%
   summarise(N_mean = mean(N), .groups = "drop")
 
-# Rescale averaged counts so they sum to group totals (and round exactly)
+# Rescale averaged counts so they sum to group totals 
 counts_adjusted <- counts_avg %>%
   left_join(group_sizes_avg, by = "age_group") %>%
   group_by(age_group, Variable) %>%
   mutate(
     total_mean = sum(N_mean, na.rm = TRUE),
-    # proportional rescale within each Variable so categories sum to group_N_avg
     N_rescaled = ifelse(total_mean > 0, N_mean / total_mean * group_N_avg, 0),
-    # integer rounding while preserving the exact group total
     N_floor = floor(N_rescaled),
     remainder = N_rescaled - N_floor,
     shortfall = round(unique(group_N_avg)) - sum(N_floor),
@@ -226,7 +227,31 @@ counts_adjusted <- counts_avg %>%
   select(age_group, Variable, Category, N) %>%
   arrange(Variable, age_group, Category)
 
-## Correlation analysis
+## Calcualte Median
+median_sleep <- lapply(seq_along(df_imp), function(i) {
+  
+  d <- as.data.frame(df_imp[[i]])
+  
+  d %>%
+    group_by(age_group) %>%
+    summarise(
+      median_sleep = median(as.numeric(sleep_hr), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(.imp = i)
+  
+})
+
+median_sleep_pooled <- bind_rows(median_sleep) %>%
+  group_by(age_group) %>%
+  summarise(
+    median_sleep = mean(median_sleep),
+    .groups = "drop"
+  )
+
+median_sleep_pooled
+
+# Convert the value to numeric
 to_numeric_safe <- function(x) {
   if (is.numeric(x)) return(x)
   if (is.factor(x)) x <- as.character(x)
@@ -238,8 +263,7 @@ to_numeric_safe <- function(x) {
   suppressWarnings(as.numeric(x))
 }
 
-# Choose the column that we want for the correlation
-pick_cols <- c("Identifiers", names(df_imp[[1]])[c(17:21, 23, 1:15, 26:28)])
+pick_cols <- c("Identifiers", names(df_imp[[1]])[c(18:24, 1:16, 27:28)])
 
 # Extract only existing variables, per imputation
 dat_list <- lapply(df_imp, function(d) d[, intersect(pick_cols, names(d)), drop = FALSE])
@@ -248,18 +272,11 @@ pos_vars <- 2:25
 dat_list_num <- lapply(dat_list, function(d) {
   d2 <- d
   
-  # Recode sex to 1/2 consistently across imputations
-  if ("sex" %in% names(d2)) {
-    sx <- tolower(trimws(as.character(d2$sex)))
-    d2$sex <- ifelse(sx %in% c("m"), 1,
-                     ifelse(sx %in% c("f"), 2, NA_real_))
-  }
-  
-  # convert everything to numeric except ID and sex
+  # Convert other variables to numeric 
   cols <- intersect(pos_vars, seq_along(d2))
   for (j in cols) {
     nm <- names(d2)[j]
-    if (nm %in% c("Identifiers", "sex")) next
+    if (nm %in% c("Identifiers")) next
     d2[[j]] <- to_numeric_safe(d2[[j]])
   }
   
@@ -278,35 +295,43 @@ vars_final <- intersect(vars_final, names(dat_list_num[[1]])[pos_vars])
 
 stopifnot(length(vars_final) >= 2)  
 
-# Run pooled correlation
+# Build mids and run pooled Pearson correlations
 imp_data_num <- miceadds::datlist2mids(dat_list_num)
-cor_out <- miceadds::micombine.cor(mi.res = imp_data_num, variables = vars_final, method = "pearson")
 
-# save correlation result into csv
-write.csv(cor_out, "correlation.csv")
-
-
-## Run the linear regression
+## Run Linear regression
 mi_lm_summary <- function(mids_obj, formula) {
+  # Ensure we have a formula object
   if (!inherits(formula, "formula")) formula <- stats::as.formula(formula)
   
   # Complete all imputations to a list of data frames
   imps <- mice::complete(mids_obj, action = "all")   # list length = m
   
-  # Fit lm() in each completed dataset 
-  fits <- lapply(imps, function(d) stats::lm(formula, data = d))
+  fits <- lapply(imps, function(d) {
+    
+    vars <- all.vars(formula)
+    
+    d2 <- d
+    
+    for (v in vars) {
+      if (is.numeric(d2[[v]])) {
+        d2[[v]] <- scale(d2[[v]])
+      }
+    }
+    
+    stats::lm(formula, data = d2)
+  })
   
   # Convert to a 'mira' object and pool (Rubin's rules)
   mira_obj <- mice::as.mira(fits)
   pooled   <- mice::pool(mira_obj)
   
-  # Coefficient table 
+  # Coefficient table across imputation 
   coef_table <- as.data.frame(summary(pooled))
   
-  # Adjusted R^2 
+  # Adjusted R^2 across imputation
   adj_r2 <- mean(sapply(fits, function(m) summary(m)$adj.r.squared), na.rm = TRUE)
   
-  # Pooled F, df1, df2, p 
+  # Robust pooled F, df1, df2, p 
   fstats <- do.call(rbind, lapply(fits, function(m) {
     fs <- summary(m)$fstatistic
     if (is.null(fs) || length(fs) < 3) return(c(F = NA, df1 = NA, df2 = NA))
@@ -323,21 +348,24 @@ mi_lm_summary <- function(mids_obj, formula) {
   }
   
   list(
-    coefficients = coef_table,  
-    adj_r2       = adj_r2,      
+    coefficients = coef_table,   
+    adj_r2       = adj_r2,       
     F            = F_pooled,     
-    df1          = df1_pooled,   
+    df1          = df1_pooled,
     df2          = df2_pooled,
     p_value_F    = p_pooled,
     fstats_raw   = fstats       
   )
 }
 
-# Run the linear regression function 
+# Run the function
 res1 <- mi_lm_summary(imp_data_num, 
-                      CBCL_Total_T ~ SDS_DA_T + SDS_DIMS_T + SDS_DOES_T + SDS_SBD_T + 
-                        SDS_SHY_T + SDS_SWDT_T + BMI_perc + hhi + puberty_stage +
-                        age + sex + comorbidity_count)
+                      CBCL_Total ~ (SDS_DA + SDS_DIMS + SDS_DOES + SDS_SBD + 
+                        SDS_SHY + SDS_SWDT) * age_group + BMI + hhi + puberty_stage +
+                       sex + comorbidity_count)
+
+# beta estimates
+beta_df <- as.data.frame(res1$coefficients)
 
 # Model summary
 model_df <- data.frame(
@@ -348,7 +376,7 @@ model_df <- data.frame(
   p_value  = res1$p_value_F
 )
 
-## MANOVA + post hoc test 
+## MANOVA + Post hoc 
 # Complete each imputation and align factor levels for group
 complete_align <- function(mids_obj, group = "age_group", levels = c("pre","early","late")) {
   imps <- mice::complete(mids_obj, action = "all")
@@ -387,7 +415,7 @@ rubin_pool_scalar <- function(est, se, df_complete = NULL) {
   data.frame(estimate = Qbar, se = se_p, df = df, t_ratio = tval, p_value = pval)
 }
 
-# Normalize emmeans contrast rows 
+# Normalize emmeans contrast rows
 normalize_contrast_rows <- function(pairs_df) {
   out <- pairs_df %>%
     tidyr::separate(contrast, into = c("g1","g2"), sep = " - ", remove = FALSE) %>%
@@ -398,7 +426,7 @@ normalize_contrast_rows <- function(pairs_df) {
         (g1 == "late"  & g2 == "pre")  | (g1 == "pre"   & g2 == "late")  ~ "late-pre",
         TRUE ~ NA_character_
       ),
-      flip = case_when(                      # need to flip sign when reversed
+      flip = case_when(                      
         target == "early-late" & g1 == "late"  & g2 == "early" ~ TRUE,
         target == "early-pre"  & g1 == "pre"   & g2 == "early" ~ TRUE,
         target == "late-pre"   & g1 == "pre"   & g2 == "late"  ~ TRUE,
@@ -442,7 +470,7 @@ mi_tukey_pooled <- function(mids_obj, dv, group = "age_group",
     # Linear model
     m <- stats::lm(as.formula(paste(dv, "~", group)), data = d)
     
-    # Robust covariance (HC3) to accomodate heterogenity 
+    # Robust covariance (HC3) 
     vc <- if (robust) {
       sandwich::vcovHC(m, type = "HC3")
     } else {
@@ -531,8 +559,7 @@ mi_tukey_pooled <- function(mids_obj, dv, group = "age_group",
   final
 }
 
-
-## MANOVA (Pillai) across imputations
+# MANOVA (Pillai) across imputations
 mi_manova_pillai <- function(mids_obj, dvs, group = "age_group",
                              levels = c("pre","early","late"),
                              stouffer_weights = c("equal","sqrt_df")) {
@@ -605,14 +632,14 @@ mi_manova_pillai <- function(mids_obj, dvs, group = "age_group",
   )
 }
 
-## RUN MANOVA and post hoc function 
-mids_obj   <- imp_data_num              # make sure MIDs object
+# Run MANOVA 
+mids_obj   <- imp_data_num              
 group_var  <- "age_group"
 age_levels <- c("pre","early","late")
 
 SCARED <- c("SCARED_P_GD","SCARED_P_PN","SCARED_P_SC","SCARED_P_SH","SCARED_P_SP")
-SDS    <- c("SDS_DA_T","SDS_DIMS_T","SDS_DOES_T","SDS_SBD_T","SDS_SHY_T","SDS_SWDT_T")
-CBCL   <- c("CBCL_Int_T","CBCL_Ext_T")
+SDS    <- c("SDS_DA","SDS_DIMS","SDS_DOES","SDS_SBD","SDS_SHY","SDS_SWDT")
+CBCL   <- c("CBCL_Int","CBCL_Ext")
 
 manova_scared <- mi_manova_pillai(mids_obj, SCARED, group = group_var,
                                   levels = age_levels, stouffer_weights = "sqrt_df")
@@ -633,28 +660,31 @@ tukey_cbcl<- dplyr::bind_rows(lapply(CBCL, function(dv) {
   mi_tukey_pooled(mids_obj, dv, group = group_var, levels = age_levels, adjust = "tukey")
 }))
 
-## Chi-square test 
+# Chi-square test
 chis_by_imp <- lapply(df_imp, function(d) {
+  # Ensure data frame
   d <- as.data.frame(d)
   
+  # Make sure variables exist and are factors
   if (!("age_group" %in% names(d))) stop("age_group not found in dataset")
   if (!("sex"       %in% names(d))) stop("sex not found in dataset")
   
   d$age_group <- as.factor(d$age_group)
   d$sex       <- as.factor(d$sex)
   
-  # Build the 2-way table and run Pearson chi-square
+  # Build the 2-way table and run Pearson chi-square 
   tab <- table(d$age_group, d$sex)
   
   if (any(dim(tab) == 0)) stop("Empty table: check factor levels or data.")
   
   cs <- suppressWarnings(chisq.test(tab, correct = FALSE))
   
+  # Return only scalars
   list(stat = unname(cs$statistic), df = unname(cs$parameter))
 })
 
 
-## Extract vectors and sanity-check
+# Extract vectors and sanity-check
 chisq_stats <- vapply(chis_by_imp, `[[`, numeric(1), "stat")
 dfs         <- vapply(chis_by_imp, `[[`, numeric(1), "df")
 
@@ -667,20 +697,30 @@ ok <- is.finite(chisq_stats) & is.finite(dfs)
 chisq_stats <- chisq_stats[ok]
 dfs         <- dfs[ok]
 
-## Run chi-square on the imputed data
+# Sanity checks
+stopifnot(is.null(dim(chisq_stats)), is.null(dim(dfs)))
+stopifnot(length(chisq_stats) == length(dfs), length(chisq_stats) > 0)
+
 mi_res <- miceadds::micombine.chisquare(chisq_stats, dfs)
 
-# Pull chi-square result
+## Print a single pooled result
+mi_res
+
+# Pull the first F and p 
 F_pool <- unname(mi_res[grep("^D\\d+$",  names(mi_res))][1])
 p_pool <- unname(mi_res[grep("^p\\d+$",  names(mi_res))][1])
+
 df_num <- unname(mi_res[grep("^df\\d+$", names(mi_res))][1])
 df_den <- unname(mi_res[grep("^df2\\d+$", names(mi_res))][1])
 
+cat(sprintf("Pooled result: F(%.0f, %.3g) = %.3f, p = %.5f\n",
+            df_num, df_den, F_pool, p_pool))
 
-## ANOVA 
+#------ ANOVA 
+
 fit <- with(
   imp_data_num,
-  lm(SDS_Total_T ~ age_group)
+  lm(SCARED_P_Total ~ age_group)
 )
 
 stats <- lapply(fit$analyses, function(m) {
@@ -707,110 +747,35 @@ p_val <- pf(F_bar, df1bar, df2bar, lower.tail = FALSE)
 
 c(F = F_bar, df1 = df1bar, df2 = df2bar, p = p_val)
 
-# Classification of the clinical-range
-class_sdsc <- function(x) {
-  case_when(
-    is.na(x)        ~ NA_character_,
-    x >= 70         ~ "Clinical",
-    x >= 50         ~ "Borderline",
-    TRUE            ~ "Non-clinical"
+posthoc_stats <- lapply(fit$analyses, function(m) {
+  
+  em <- emmeans::emmeans(m, ~ age_group)
+  pw <- as.data.frame(pairs(em, adjust = "tukey"))
+  
+  data.frame(
+    contrast = pw$contrast,
+    estimate = pw$estimate,
+    t        = pw$t.ratio,
+    p        = pw$p.value
   )
-}
-
-class_cbcl <- function(x) {
-  case_when(
-    is.na(x)        ~ NA_character_,
-    x >= 64         ~ "Clinical",
-    x >= 60         ~ "Borderline",
-    TRUE            ~ "Non-clinical"
-  )
-}
-
-class_scared <- function(x, cutoff) {
-  case_when(
-    is.na(x)        ~ NA_character_,
-    x >= cutoff    ~ "Clinical",
-    TRUE            ~ "Non-clinical"
-  )
-}
-
-df_imp <- lapply(df_imp, function(d) {
-  d <- as.data.frame(d)
-  
-  ## SDSC
-  sdsc_vars <- c("SDS_DA_T","SDS_DIMS_T","SDS_DOES_T",
-                 "SDS_SBD_T","SDS_SHY_T","SDS_SWDT_T", "SDS_Total_T")
-  for (v in sdsc_vars[sdsc_vars %in% names(d)]) {
-    d[[paste0(v, "_class")]] <- class_sdsc(d[[v]])
-  }
-  
-  ## CBCL
-  cbcl_vars <- c("CBCL_Int_T","CBCL_Ext_T","CBCL_Total_T")
-  for (v in cbcl_vars[cbcl_vars %in% names(d)]) {
-    d[[paste0(v, "_class")]] <- class_cbcl(d[[v]])
-  }
-  
-  ## SCARED
-  if ("SCARED_P_Total" %in% names(d))
-    d$SCARED_P_Total_class <- class_scared(d$SCARED_P_Total, 25)
-  if ("SCARED_P_GD" %in% names(d))
-    d$SCARED_P_GD_class <- class_scared(d$SCARED_P_GD, 9)
-  if ("SCARED_P_PN" %in% names(d))
-    d$SCARED_P_PN_class <- class_scared(d$SCARED_P_PN, 7)
-  if ("SCARED_P_SC" %in% names(d))
-    d$SCARED_P_SC_class <- class_scared(d$SCARED_P_SC, 8)
-  if ("SCARED_P_SH" %in% names(d))
-    d$SCARED_P_SH_class <- class_scared(d$SCARED_P_SH, 3)
-  if ("SCARED_P_SP" %in% names(d))
-    d$SCARED_P_SP_class <- class_scared(d$SCARED_P_SP, 5)
-  
-  d
 })
 
+posthoc_stats <- do.call(rbind, posthoc_stats)
 
-get_prop <- function(var) { 
-  # compute proportions within each imputation
-  results <- bind_rows(lapply(seq_along(df_imp), function(i) {
-    df_imp[[i]] %>%
-      filter(!is.na(age_group),
-             !is.na(.data[[var]])) %>%
-      count(age_group, Category = .data[[var]]) %>%
-      group_by(age_group) %>%
-      mutate(
-        total_n = sum(n),
-        prop = n / total_n,
-        .imp = i
-      )
-  }))
+posthoc_pooled <- aggregate(. ~ contrast, data = posthoc_stats, function(x) {
   
-  # pool across imputations
-  results <- results %>%
-    group_by(age_group, Category) %>%
-    summarise(
-      prop = mean(prop, na.rm = TRUE),
-      N = round(mean(total_n, na.rm = TRUE)),
-      .groups = "drop"
-    )
+  if (is.numeric(x)) mean(x)
   
-  # compute counts 
-  results <- results %>%
-    group_by(age_group) %>%
-    mutate(
-      n_raw = prop * N,
-      n = floor(n_raw)  
-    ) %>%
-    mutate(
-      remainder = N - sum(n)  
-    ) %>%
-    mutate(
-      rank = rank(-n_raw, ties.method = "first"),
-      n = n + ifelse(rank <= remainder, 1, 0) 
-    ) %>%
-    ungroup() %>%
-    select(age_group, Category, prop, N, n)
-  
-  return(results)
-}
+})
 
- # Run the function
-get_prop("SDS_Total_T_class")
+posthoc_p <- aggregate(p ~ contrast, data = posthoc_stats, function(pvals) {
+  pvals <- pmin(pmax(pvals, .Machine$double.xmin), 1 - .Machine$double.xmin)
+  
+  X2 <- -2 * sum(log(pvals))   
+  1 - pchisq(X2, df = 2 * length(pvals))
+})
+
+posthoc_final <- merge(posthoc_pooled, posthoc_p, by = "contrast", suffixes = c("_mean", "_pooled"))
+
+posthoc_final
+
